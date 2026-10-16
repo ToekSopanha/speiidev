@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodev-orchestrator"
+version = "4.0.0"
+description = "Interactive Multi-Agent TUI with pluggable agents, model switcher, diff gate, and conversation memory."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "SpeiiDev Team" }
+]
+keywords = [
+    "multi-agent",
+    "orchestrator",
+    "ai",
+    "tui",
+    "claude",
+    "gemini",
+    "opencode",
+    "antigravity",
+    "developer-tools",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
+]
+
+[project.optional-dependencies]
+image = [
+    "Pillow>=9.0.0",
+]
+
+[project.scripts]
+autodev = "autodev.cli:main"
+speiidev = "autodev.cli:main"
+block-font = "autodev.font:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

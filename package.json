@@ -1,0 +1,12 @@
+{
+  "name": "speiidev",
+  "version": "1.0.0",
+  "description": "Multi-agent terminal orchestrator wrapper",
+  "bin": {
+    "speiidev": "./bin/cli.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "license": "MIT"
+}
