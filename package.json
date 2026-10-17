@@ -1,9 +1,10 @@
 {
   "name": "speiidev",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Multi-agent terminal orchestrator wrapper",
+  "author": "Toek Sopanha",
   "bin": {
-    "speiidev": "./bin/cli.js"
+    "speiidev": "bin/speiidev.js"
   },
   "engines": {
     "node": ">=16.0.0"

@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 def main() -> int:

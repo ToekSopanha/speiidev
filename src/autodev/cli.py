@@ -14,6 +14,7 @@ to each role. The first run asks which CLI to use for each role and remembers it
 from __future__ import annotations
 
 import argparse
+import asyncio
 import difflib
 import json
 import os
@@ -23,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -44,19 +46,20 @@ from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
-from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
 from autodev.font import render_block_text
+from autodev._version import __version__
 
 console = Console()
 
-APP_VERSION = "4.0"
+APP_VERSION = __version__
 VERIFIED_MARKER = "STATUS: VERIFIED"
 FIXES_MARKER = "STATUS: NEEDS_FIXES"
 
@@ -92,6 +95,8 @@ CONFIG_DIR = Path(
 )
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history"
+REMBER_FILE = CONFIG_DIR / "speiidevrember.json"
+REMBER_MAX = 5
 
 PERSISTED_KEYS = (
     "planner",
@@ -102,7 +107,6 @@ PERSISTED_KEYS = (
     "builder_effort",
     "permission_mode",
     "approved_actions",
-    "conversation_id",
 )
 
 SLASH_COMMANDS = [
@@ -116,6 +120,7 @@ SLASH_COMMANDS = [
     "/perms",
     "/log",
     "/conv",
+    "/rember",
     "/diff",
     "/show",
     "/font",
@@ -141,6 +146,10 @@ class AgentState:
     last_status: str = "IDLE"
     git_branch: str = field(default_factory=lambda: get_git_branch())
     conversation_id: str | None = None
+    # Locally generated id identifying this terminal session's chat (not the
+    # agent's own conversation uuid). Saved to speiidevrember.json on exit.
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    last_task: str = ""
     # Pluggable agent roles (keys into PROFILES)
     planner: str = "agy"
     builder: str = "opencode"
@@ -244,6 +253,58 @@ def _migrate_config(cfg: dict) -> dict:
         if "default" in str(m.get(key, "")).lower():
             m[key] = "default"
     return m
+
+
+# ---------------------------------------------------------------------------
+# REMEMBERED CHATS  (~/.config/speiidev/speiidevrember.json)
+# Old conversations are never resumed automatically. Every chat id is written
+# here with a timestamp so it can be recalled explicitly via /rember.
+# ---------------------------------------------------------------------------
+def load_rember() -> list[dict]:
+    try:
+        data = json.loads(REMBER_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [e for e in data if isinstance(e, dict) and e.get("id")]
+        if isinstance(data, dict) and data.get("id"):
+            return [data]
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def save_rember(entries: list[dict]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = REMBER_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        tmp.replace(REMBER_FILE)
+    except OSError:
+        pass
+
+
+def remember_conversation(conversation_id: str, label: str = "") -> None:
+    """Record a conversation id + timestamp, newest first, de-duplicated by id."""
+    if not conversation_id:
+        return
+    entry = {
+        "id": conversation_id,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "label": label or f"chat {conversation_id[:8]}",
+    }
+    entries = [e for e in load_rember() if e.get("id") != conversation_id]
+    entries.insert(0, entry)
+    save_rember(entries[:REMBER_MAX])
+
+
+def persist_active_chat(state: "AgentState") -> None:
+    """Save this session's chat id to speiidevrember.json on tool exit.
+
+    Uses the agent conversation uuid when one is set, otherwise the locally
+    generated session id, so every session is always remembered.
+    """
+    chat_id = state.conversation_id or state.session_id
+    label = state.last_task or state.last_agent or ""
+    remember_conversation(chat_id, label)
 
 
 # ============================================================================
@@ -358,6 +419,14 @@ class AgentProfile:
     def build(self, role, prompt, model, effort, allow_tools, plan_file, session_id):
         builder = self.plan_builder if role == "plan" else self.build_builder
         if builder is None:
+            # Auto-fallback to a profile that can serve this role (prefer installed ones)
+            candidates = installed_for_role(role)
+            if candidates:
+                fallback = candidates[0]
+                fb = PROFILES[fallback]
+                builder_fb = fb.plan_builder if role == "plan" else fb.build_builder
+                if builder_fb is not None:
+                    return builder_fb(prompt, model, effort, allow_tools, plan_file, session_id)
             raise ValueError(f"{self.label} cannot act as {role}")
         return builder(prompt, model, effort, allow_tools, plan_file, session_id)
 
@@ -396,6 +465,18 @@ PROFILES: dict[str, AgentProfile] = {
 
 def installed_profiles() -> list[str]:
     return [key for key, prof in PROFILES.items() if get_safe_executable(prof.binary)]
+
+
+def installed_for_role(role: str) -> list[str]:
+    """Installed agent CLIs on this PC that can serve a role ("plan"/"build")."""
+    return [k for k in installed_profiles() if role in PROFILES[k].roles]
+
+
+def first_installed_for(role: str) -> str | None:
+    found = installed_profiles()
+    for key in found:
+        return key
+    return None
 
 
 def _preview_cmd(cmd: list[str]) -> str:
@@ -643,10 +724,15 @@ def render_colored_diff_panel(change: FileChange) -> Panel:
         f"[bold bright_red]-{removed_count} old[/bold bright_red]"
     )
 
-    legend = Text.from_markup(
-        "[bold bright_green on #113311] + Green = New Code Added [/bold bright_green on #113311]   "
-        "[bold bright_red on #3b1219] - Red = Old Code Removed [/bold bright_red on #3b1219]"
-    )
+    w = console.width
+    pad_h = 2 if w >= 80 else 1
+    if w >= 65:
+        legend = Text.from_markup(
+            "[bold bright_green on #113311] + Green = New Code Added [/bold bright_green on #113311]   "
+            "[bold bright_red on #3b1219] - Red = Old Code Removed [/bold bright_red on #3b1219]"
+        )
+    else:
+        legend = Text.from_markup("[green]+ New Code[/green]  [red]- Old Code[/red]")
 
     return Panel(
         Group(legend, Rule(style="dim"), diff_text),
@@ -654,7 +740,7 @@ def render_colored_diff_panel(change: FileChange) -> Panel:
         title_align="left",
         border_style="bright_magenta",
         box=box.ROUNDED,
-        padding=(0, 2),
+        padding=(0, pad_h),
     )
 
 
@@ -752,6 +838,11 @@ def searchable_select(
     if current is not None and current in values:
         st["sel"] = values.index(current)
 
+    def get_dynamic_height() -> int:
+        term_lines = shutil.get_terminal_size((80, 24)).lines
+        max_h = max(2, term_lines - 7)
+        return min(height, max_h, max(1, len(options)))
+
     def recompute(reset: bool = True) -> None:
         q = st["query"].strip().lower()
         if not q:
@@ -782,11 +873,13 @@ def searchable_select(
         res = st["results"]
         if not res:
             return [("class:dim", "  (no matches)")]
-        win = height
+        win = get_dynamic_height()
         start = 0
         if st["sel"] >= win:
             start = st["sel"] - win + 1
         end = min(len(res), start + win)
+        term_cols = shutil.get_terminal_size((80, 24)).columns
+        max_label_w = max(10, term_cols - 14)
         lines = []
         for pos in range(start, end):
             value, label = options[res[pos]]
@@ -795,7 +888,10 @@ def searchable_select(
             mark = "  (current)" if is_cur else ""
             cursor = "> " if is_sel else "  "
             cls = "sel" if is_sel else ("current" if is_cur else "item")
-            lines.append((f"class:{cls}", f"{cursor}{label}{mark}\n"))
+            disp = label
+            if len(disp) + len(mark) > max_label_w:
+                disp = disp[: max(1, max_label_w - len(mark) - 1)] + "…"
+            lines.append((f"class:{cls}", f"{cursor}{disp}{mark}\n"))
         return lines
 
     def status_text():
@@ -804,7 +900,10 @@ def searchable_select(
         return [("class:dim", f"  {pos}/{n}")]
 
     def footer_text():
-        return [("class:footer", f"Keyboard: {footer}")]
+        term_cols = shutil.get_terminal_size((80, 24)).columns
+        if term_cols < 55:
+            return [("class:footer", "  ↑/↓ Enter Esc")]
+        return [("class:footer", f"  Keyboard: {footer}")]
 
     style = Style.from_dict(
         {
@@ -830,7 +929,7 @@ def searchable_select(
             Window(char="─", height=1, style="class:sep"),
             Window(
                 FormattedTextControl(list_text),
-                height=min(height, max(1, len(options))),
+                height=get_dynamic_height,
             ),
             Window(FormattedTextControl(status_text), height=1),
             Window(FormattedTextControl(footer_text), height=1),
@@ -856,14 +955,16 @@ def searchable_select(
 
     @kb.add("pageup")
     def _(event):
+        win = get_dynamic_height()
         if st["results"]:
-            st["sel"] = max(0, st["sel"] - height)
+            st["sel"] = max(0, st["sel"] - win)
         event.app.invalidate()
 
     @kb.add("pagedown")
     def _(event):
+        win = get_dynamic_height()
         if st["results"]:
-            st["sel"] = min(len(st["results"]) - 1, st["sel"] + height)
+            st["sel"] = min(len(st["results"]) - 1, st["sel"] + win)
         event.app.invalidate()
 
     @kb.add("enter")
@@ -905,6 +1006,7 @@ def searchable_select(
             style=style,
             full_screen=False,
             mouse_support=False,
+            terminal_size_polling_interval=0.5,
         ).run()
     except (EOFError, KeyboardInterrupt):
         return None
@@ -935,15 +1037,22 @@ def request_permission(
             f"[{THEME['dim']}]Use arrow keys to choose, Enter to confirm.[/]"
         ),
     )
+    w = console.width
+    pad_h = 2 if w >= 80 else 1
+    panel_title = (
+        f"[bold {THEME['auditor']}]🔐 Permissions requested[/bold {THEME['auditor']}]  "
+        f"[{THEME['dim']}]{title}[/]"
+        if w >= 70
+        else f"[bold {THEME['auditor']}]🔐 Permissions[/]"
+    )
     console.print(
         Panel(
             body,
-            title=f"[bold {THEME['auditor']}]🔐 Permissions requested[/bold {THEME['auditor']}]  "
-            f"[{THEME['dim']}]{title}[/]",
+            title=panel_title,
             title_align="left",
             border_style=THEME["auditor"],
             box=box.ROUNDED,
-            padding=(0, 2),
+            padding=(0, pad_h),
         )
     )
 
@@ -1062,25 +1171,39 @@ def run_splash(state: AgentState) -> None:
     if not console.is_terminal:
         return
 
-    cabbage = render_bok_choy_logo()
     boot_steps = [
         ("booting orchestrator", "kernel"),
         ("linking architect", "agy · gemini"),
         ("linking builder", "opencode"),
         ("waking workspace", Path.cwd().name),
     ]
-    width = 36
 
     try:
         with Live(
             console=console, refresh_per_second=24, transient=True
         ) as live:
             for idx, (label, tag) in enumerate(boot_steps, start=1):
-                filled = int(width * idx / len(boot_steps))
-                bar = "█" * filled + "░" * (width - filled)
-                status_grid = Table.grid(padding=(0, 3))
-                status_grid.add_column(justify="left")
-                status_grid.add_column(justify="left", ratio=1)
+                w = console.width
+                h = console.size.height or 24
+
+                # Responsive title typography
+                if w >= 80:
+                    art = render_block_text("SPEIIDEV", style="claude", color="none")
+                    title_node = Text.from_markup(f"[bold {THEME['primary']}]{art}[/]")
+                elif w >= 52:
+                    art = render_block_text("SPEIIDEV", style="mini", color="none")
+                    title_node = Text.from_markup(f"[bold {THEME['primary']}]{art}[/]")
+                else:
+                    title_node = Text.from_markup(
+                        f"[bold {THEME['primary']}]SPEIIDEV[/bold {THEME['primary']}] "
+                        f"[{THEME['dim']}]v{APP_VERSION}[/]"
+                    )
+
+                show_full_cabbage = (w >= 80 and h >= 22)
+                bar_width = max(10, min(36, w - 46 if show_full_cabbage else w - 24))
+                filled = int(bar_width * idx / len(boot_steps))
+                bar = "█" * filled + "░" * (bar_width - filled)
+
                 status_body = Group(
                     Text.from_markup(
                         f"[bold {THEME['primary']}]SPEIIDEV[/bold {THEME['primary']}] "
@@ -1095,24 +1218,39 @@ def run_splash(state: AgentState) -> None:
                         f"  [{THEME['dim']}]{label}[/] "
                         f"[{THEME['architect']}]{tag}[/]"
                     ),
-                    Text.from_markup(
-                        f"\n[{THEME['dim']}]Initializing neural coding environment…[/]"
-                    ),
                 )
-                status_grid.add_row(cabbage, status_body)
+                if h >= 20:
+                    status_body = Group(
+                        status_body,
+                        Text.from_markup(
+                            f"\n[{THEME['dim']}]Initializing neural coding environment…[/]"
+                        ),
+                    )
+
+                if show_full_cabbage:
+                    cabbage = render_bok_choy_logo()
+                    status_grid = Table.grid(padding=(0, 2 if w < 86 else 3))
+                    status_grid.add_column(justify="left")
+                    status_grid.add_column(justify="left", ratio=1)
+                    status_grid.add_row(cabbage, status_body)
+                    splash_content = status_grid
+                else:
+                    splash_content = status_body
 
                 body = Group(
-                    Text.from_markup(f"[bold {THEME['primary']}]{SPEIIDEV_ASCII}[/]"),
+                    title_node,
                     Rule(style=THEME["dim"]),
-                    status_grid,
+                    splash_content,
                 )
 
+                pad_h = 2 if w >= 86 else 1
+                pad_v = 1 if (w >= 80 and h >= 22) else 0
                 live.update(
                     Panel(
                         body,
                         box=box.ROUNDED,
                         border_style=THEME["primary"],
-                        padding=(1, 2),
+                        padding=(pad_v, pad_h),
                     )
                 )
                 time.sleep(0.24)
@@ -1122,68 +1260,311 @@ def run_splash(state: AgentState) -> None:
 
 
 def print_banner(state: AgentState) -> None:
-    cabbage = render_bok_choy_logo()
+    w = console.width
+    h = console.size.height or 24
 
-    conv_display = (
-        f"[{THEME['ok']}]{state.conversation_id[:8]}…[/{THEME['ok']}]"
-        if state.conversation_id
-        else f"[{THEME['dim']}]new session[/{THEME['dim']}]"
-    )
+    # 1. Responsive Title Art
+    if w >= 80:
+        art = render_block_text("SPEIIDEV", style="claude", color="none")
+        title_renderable = Text.from_markup(f"[bold {THEME['primary']}]{art}[/]")
+    elif w >= 52:
+        art = render_block_text("SPEIIDEV", style="mini", color="none")
+        title_renderable = Text.from_markup(f"[bold {THEME['primary']}]{art}[/]")
+    else:
+        title_renderable = Text.from_markup(
+            f"[bold {THEME['primary']}]SPEIIDEV[/bold {THEME['primary']}] "
+            f"[{THEME['dim']}]v{APP_VERSION}[/]"
+        )
 
-    info_grid = Table.grid(expand=True)
-    info_grid.add_column(justify="left", ratio=1)
-    info_grid.add_column(justify="right")
-
-    left_info = (
-        f"[{THEME['dim']}]repo  [/][bold {THEME['text']}]{Path.cwd().name}[/bold {THEME['text']}] "
-        f"[{THEME['dim']}]on[/] [{THEME['ok']}]{state.git_branch}[/{THEME['ok']}]\n"
-        f"[{THEME['dim']}]chat  [/]{conv_display}\n"
-        f"[{THEME['architect']}]◆ plan [/] [{THEME['text']}]{state.planner}[/] "
-        f"[{THEME['dim']}]{state.planner_model} · {state.planner_effort}[/]\n"
-        f"[{THEME['builder']}]◆ build[/] [{THEME['text']}]{state.builder}[/] "
-        f"[{THEME['dim']}]{state.builder_model} · {state.builder_effort}[/]"
-    )
-    right_info = (
-        f"[{THEME['dim']}]gate  [/]{_mode_badge(state.permission_mode)}\n"
-        f"[{THEME['dim']}]agents[/] [{THEME['text']}]{state.planner} · {state.builder}[/]\n\n"
-        f"[yellow]F2[/] [{THEME['dim']}]menu ·[/] [yellow]F3[/] [{THEME['dim']}]activity[/]"
-    )
-    info_grid.add_row(Text.from_markup(left_info), Text.from_markup(right_info))
-
-    meta_grid = Table.grid(padding=(0, 3))
-    meta_grid.add_column(justify="left")
-    meta_grid.add_column(justify="left", ratio=1)
-    meta_grid.add_row(cabbage, info_grid)
-
-    banner_content = Group(
-        Text.from_markup(f"[bold {THEME['primary']}]{SPEIIDEV_ASCII}[/]"),
-        Text.from_markup(
+    # 2. Subtitle
+    if w >= 60:
+        sub = Text.from_markup(
             f"\n[bold {THEME['primary']}]SPEIIDEV[/bold {THEME['primary']}] "
             f"[{THEME['dim']}]v{APP_VERSION}[/{THEME['dim']}]  ·  "
             f"[bold {THEME['text']}]Autonomous Multi-Agent Orchestrator[/bold {THEME['text']}]"
-        ),
-        Rule(style=THEME["dim"]),
-        meta_grid,
+        )
+    else:
+        sub = Text.from_markup(
+            f"[bold {THEME['text']}]Autonomous Multi-Agent Orchestrator[/bold {THEME['text']}]"
+        )
+
+    banner_items: list = [title_renderable, sub, Rule(style=THEME["dim"])]
+
+    # 3. Active conversation string
+    active_chat = state.conversation_id or state.session_id
+    conv_display = (
+        f"[{THEME['ok']}]{active_chat[:8]}…[/{THEME['ok']}]"
+        if state.conversation_id
+        else f"[{THEME['dim']}]{active_chat[:8]}… (new)[/{THEME['dim']}]"
     )
+
+    # 4. Mascot and Workspace Info
+    show_full_cabbage = (w >= 80 and h >= 22)
+    if show_full_cabbage:
+        cabbage = render_bok_choy_logo()
+        info_grid = Table.grid(expand=True)
+        info_grid.add_column(justify="left", ratio=1)
+        info_grid.add_column(justify="right")
+
+        repo_name = Path.cwd().name
+        branch_name = state.git_branch
+        max_repo = 16 if w < 95 else 24
+        if len(repo_name) > max_repo:
+            repo_name = repo_name[: max_repo - 1] + "…"
+        max_branch = 12 if w < 95 else 20
+        if len(branch_name) > max_branch:
+            branch_name = branch_name[: max_branch - 1] + "…"
+
+        if w >= 95:
+            plan_line = (
+                f"[{THEME['architect']}]◆ plan [/] [{THEME['text']}]{state.planner}[/] "
+                f"[{THEME['dim']}]{state.planner_model} · {state.planner_effort}[/]"
+            )
+            build_line = (
+                f"[{THEME['builder']}]◆ build[/] [{THEME['text']}]{state.builder}[/] "
+                f"[{THEME['dim']}]{state.builder_model} · {state.builder_effort}[/]"
+            )
+        else:
+            plan_line = (
+                f"[{THEME['architect']}]◆ plan [/] [{THEME['text']}]{state.planner}[/] "
+                f"[{THEME['dim']}]{state.planner_model}[/]"
+            )
+            build_line = (
+                f"[{THEME['builder']}]◆ build[/] [{THEME['text']}]{state.builder}[/] "
+                f"[{THEME['dim']}]{state.builder_model}[/]"
+            )
+
+        left_info = (
+            f"[{THEME['dim']}]repo  [/][bold {THEME['text']}]{repo_name}[/bold {THEME['text']}] "
+            f"[{THEME['dim']}]on[/] [{THEME['ok']}]{branch_name}[/{THEME['ok']}]\n"
+            f"[{THEME['dim']}]chat  [/]{conv_display}\n"
+            f"{plan_line}\n"
+            f"{build_line}"
+        )
+        right_info = (
+            f"[{THEME['dim']}]gate  [/]{_mode_badge(state.permission_mode)}\n"
+            f"[{THEME['dim']}]agents[/] [{THEME['text']}]{state.planner} · {state.builder}[/]\n\n"
+            f"[yellow]F2[/] [{THEME['dim']}]menu ·[/] [yellow]F3[/] [{THEME['dim']}]activity[/]"
+        )
+        info_grid.add_row(Text.from_markup(left_info), Text.from_markup(right_info))
+
+        meta_grid = Table.grid(padding=(0, 2 if w < 86 else 3))
+        meta_grid.add_column(justify="left")
+        meta_grid.add_column(justify="left", ratio=1)
+        meta_grid.add_row(cabbage, info_grid)
+        banner_items.append(meta_grid)
+    elif w >= 65 and h >= 20:
+        cabbage = render_bok_choy_logo()
+        repo_name = Path.cwd().name
+        branch_name = state.git_branch
+        if len(repo_name) > 16:
+            repo_name = repo_name[:15] + "…"
+        if len(branch_name) > 12:
+            branch_name = branch_name[:11] + "…"
+        info_lines = [
+            f"[{THEME['dim']}]repo [/][bold {THEME['text']}]{repo_name}[/] [{THEME['dim']}]on[/] [{THEME['ok']}]{branch_name}[/]",
+            f"[{THEME['dim']}]chat [/]{conv_display}",
+            f"[{THEME['architect']}]plan [/] [{THEME['text']}]{state.planner}[/] [{THEME['dim']}]{state.planner_model}[/]",
+            f"[{THEME['builder']}]build[/] [{THEME['text']}]{state.builder}[/] [{THEME['dim']}]{state.builder_model}[/]",
+            f"[{THEME['dim']}]gate  [/]{_mode_badge(state.permission_mode)}",
+            f"[{THEME['dim']}]agents[/] [{THEME['text']}]{state.planner} · {state.builder}[/]",
+            "",
+            f"[yellow]F2[/] [{THEME['dim']}]menu ·[/] [yellow]F3[/] [{THEME['dim']}]activity[/]",
+        ]
+        meta_grid = Table.grid(padding=(0, 2))
+        meta_grid.add_column(justify="left")
+        meta_grid.add_column(justify="left", ratio=1)
+        meta_grid.add_row(cabbage, Text.from_markup("\n".join(info_lines)))
+        banner_items.append(meta_grid)
+    else:
+        compact_info = (
+            f"[{THEME['dim']}]repo: [/][bold {THEME['text']}]{Path.cwd().name}[/] [{THEME['dim']}]({state.git_branch})[/]  "
+            f"[{THEME['dim']}]chat: [/]{conv_display}\n"
+            f"[{THEME['architect']}]plan: [/][{THEME['text']}]{state.planner}[/]  "
+            f"[{THEME['builder']}]build: [/][{THEME['text']}]{state.builder}[/]  "
+            f"[{THEME['dim']}]gate: [/]{_mode_badge(state.permission_mode)}\n"
+            f"[yellow]F2[/] [{THEME['dim']}]menu ·[/] [yellow]F3[/] [{THEME['dim']}]activity[/]"
+        )
+        banner_items.append(Text.from_markup(compact_info))
+
+    if w >= 75 and h >= 32:
+        scan_table = build_agent_scan_table(state)
+        if scan_table is not None:
+            banner_items.extend([Rule(style=THEME["dim"]), scan_table])
+
+    pad_h = 2 if w >= 86 else 1
+    pad_v = 1 if (w >= 80 and h >= 26) else 0
 
     console.print(
         Panel(
-            banner_content,
+            Group(*banner_items),
             box=box.ROUNDED,
             border_style=THEME["primary"],
-            padding=(1, 2),
+            padding=(pad_v, pad_h),
             title=f"[{THEME['dim']}]◆ speiidev workspace ◆[/{THEME['dim']}]",
             title_align="left",
         )
     )
 
-    console.print(
-        f"  [{THEME['dim']}]Type a task, or use[/] "
-        f"[{THEME['primary']}]/agents[/] [{THEME['dim']}]·[/] "
-        f"[{THEME['primary']}]/model[/] [{THEME['dim']}]·[/] [{THEME['primary']}]/effort[/] "
-        f"[{THEME['dim']}]·[/] [{THEME['primary']}]/perms[/] [{THEME['dim']}]·[/] "
-        f"[{THEME['primary']}]/help[/{THEME['primary']}]\n"
-    )
+    if w >= 60:
+        console.print(
+            f"  [{THEME['dim']}]Type a task, or use[/] "
+            f"[{THEME['primary']}]/agents[/] [{THEME['dim']}]·[/] "
+            f"[{THEME['primary']}]/model[/] [{THEME['dim']}]·[/] [{THEME['primary']}]/effort[/] "
+            f"[{THEME['dim']}]·[/] [{THEME['primary']}]/perms[/] [{THEME['dim']}]·[/] "
+            f"[{THEME['primary']}]/help[/{THEME['primary']}]\n"
+        )
+    else:
+        console.print(
+            f"  [{THEME['dim']}]Type a task, or[/] [{THEME['primary']}]/help[/{THEME['primary']}]\n"
+        )
+
+
+_STREAM_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_STREAM_PHRASES = (
+    "Booting agent runtime",
+    "Reading workspace context",
+    "Reasoning about the task",
+    "Planning the next step",
+    "Writing files",
+    "Running tools",
+    "Reviewing output",
+)
+
+
+def _stream_bar(elapsed: float, width: int = 22) -> str:
+    """Indeterminate scrolling bar so the terminal never looks frozen."""
+    pos = int(elapsed * 7) % (width + 4)
+    cells = []
+    for i in range(width):
+        d = abs(i - pos)
+        cells.append("█" if d == 0 else "▓" if d == 1 else "▒" if d == 2 else "░")
+    return "".join(cells)
+
+
+class _AgentStreamView:
+    """Self-animating Rich renderable for a running agent subprocess.
+
+    Rich's Live auto-refresh re-invokes ``__rich_console__`` on every frame, so
+    the spinner, status phrase, scrolling bar and blinking cursor animate without
+    any manual ``live.update`` calls (which keeps it smooth and cheap).
+    """
+
+    def __init__(self, cmd, title, border_color, badge, attempt, state, lines, activity):
+        self.cmd = cmd
+        self.cmd_preview = _preview_cmd(cmd) if cmd else ""
+        self.title = title
+        self.border_color = border_color
+        self.badge = badge
+        self.attempt = attempt
+        self.state = state
+        self.lines = lines
+        self.activity = activity
+        self.start_time = time.monotonic()
+        self.done = False
+        self.exit_code = 0
+
+    def __rich_console__(self, console, options):
+        yield self._panel(time.monotonic() - self.start_time, console, options)
+
+    def _panel(self, elapsed: float, console: Console, options=None) -> Panel:
+        color = self.border_color
+        frame = _STREAM_SPINNER[int(elapsed * 12) % len(_STREAM_SPINNER)]
+        blink = "▋" if int(elapsed * 2) % 2 == 0 else " "
+
+        w = (options.max_width if options else None) or console.width or 80
+        h = console.size.height or 24
+        pad_h = 2 if w >= 80 else 1
+        inner_w = max(16, w - (pad_h * 2 + 4))
+
+        if not self.done:
+            phrase = _STREAM_PHRASES[int(elapsed / 1.6) % len(_STREAM_PHRASES)]
+            if w >= 70:
+                header = Table.grid(expand=True)
+                header.add_column(ratio=1)
+                header.add_column(justify="right")
+                header.add_row(
+                    Text.from_markup(
+                        f"[bold {color}]{frame} {self.badge}[/bold {color}] "
+                        f"{self.title} (Attempt {self.attempt})"
+                    ),
+                    Text.from_markup(f"[dim]{elapsed:.1f}s[/dim]"),
+                )
+            else:
+                short_title = self.title if len(self.title) <= 22 else self.title[:21] + "…"
+                header = Text.from_markup(
+                    f"[bold {color}]{frame} {self.badge}[/bold {color}] {short_title} [dim]{elapsed:.0f}s[/dim]"
+                )
+        else:
+            icon = "✅" if self.exit_code == 0 else "❌"
+            if w >= 60:
+                header = Text.from_markup(
+                    f"{icon} [bold {color}]{self.badge}[/bold {color}] {self.title} "
+                    f"[dim](completed in {elapsed:.1f}s)[/dim]"
+                )
+            else:
+                header = Text.from_markup(
+                    f"{icon} [bold {color}]{self.badge}[/bold {color}] [dim]{elapsed:.0f}s[/dim]"
+                )
+
+        # Single-line command preview truncated with ellipsis
+        cmd_shown = self.cmd_preview
+        if len(cmd_shown) > inner_w - 4:
+            cmd_shown = cmd_shown[: max(1, inner_w - 5)] + "…"
+        proc_line = Text(f"$ {cmd_shown}", style=THEME["dim"], no_wrap=True)
+
+        # Clamping lines vertically to prevent terminal overflow and Live scroll desync
+        overhead = 8 if (self.activity and h >= 16) else 7
+        max_body_lines = max(2, min(14, h - overhead - 2))
+
+        if self.lines:
+            visible = list(self.lines)[-max_body_lines:]
+            body = Text()
+            for idx, raw_line in enumerate(visible):
+                clean = _strip_ansi(raw_line)
+                if len(clean) > inner_w:
+                    clean = clean[: max(1, inner_w - 1)] + "…"
+                body.append(Text.from_ansi(clean))
+                if idx < len(visible) - 1:
+                    body.append("\n")
+            if not self.done:
+                body.append(f" {blink}", style=color)
+        elif self.done:
+            body = Text.from_markup(f"[{THEME['dim']}]No output.[/]")
+        else:
+            bar_len = max(8, min(22, inner_w - 32))
+            bar = _stream_bar(elapsed, width=bar_len)
+            if w >= 65:
+                body = Text.from_markup(
+                    f"[{color}]{frame}[/] [{THEME['text']}]{phrase}[/]…  "
+                    f"[{THEME['dim']}]{bar}[/] {blink}"
+                )
+            else:
+                body = Text.from_markup(
+                    f"[{color}]{frame}[/] [{THEME['text']}]{phrase}[/]… {blink}"
+                )
+
+        rows: list = [header, Rule(style="dim"), proc_line, Rule(style="dim"), body]
+
+        if self.activity and h >= 16:
+            if not self.done:
+                rows.append(
+                    Text.from_markup(
+                        f"[{THEME['dim']}]● {len(self.activity)} file(s) touched[/]"
+                    )
+                )
+            if w >= 60 and h >= 18:
+                rows.append(
+                    Text.from_markup(f"[{THEME['dim']}]full activity → /log[/] ")
+                )
+
+        border = color if (not self.done or self.exit_code == 0) else "red"
+        return Panel(
+            Group(*rows),
+            box=box.ROUNDED,
+            border_style=border,
+            padding=(0, pad_h),
+        )
 
 
 def stream_agent_box(
@@ -1219,7 +1600,6 @@ def stream_agent_box(
 
     for attempt in range(1, max_retries + 1):
         lines: deque[str] = deque(maxlen=18)
-        start_time = time.monotonic()
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -1238,64 +1618,30 @@ def stream_agent_box(
             shell=is_windows,
         )
 
-        def render_panel(done: bool = False, exit_code: int = 0) -> Panel:
-            elapsed = time.monotonic() - start_time
-            body_text = "\n".join(lines) if lines else "Waiting for agent stream..."
-            body = Text.from_ansi(body_text)
-
-            files_badge = (
-                Text.from_markup(f"[dim]● {len(activity)} file(s)[/dim] ")
-                if activity
-                else Text("")
-            )
-
-            if not done:
-                header = Table.grid(expand=True)
-                header.add_column(ratio=1)
-                header.add_column(justify="right")
-                header.add_row(
-                    Spinner(
-                        "dots",
-                        text=Text.from_markup(f"[bold {border_color}]{badge}[/bold {border_color}] {title} (Attempt {attempt})"),
-                    ),
-                    Text.from_markup(f"[dim]{elapsed:.1f}s[/dim]"),
-                )
-                content = Group(header, Rule(style="dim"), body)
-            else:
-                icon = "✅" if exit_code == 0 else "❌"
-                status_line = Text.from_markup(
-                    f"{icon} [bold {border_color}]{badge}[/bold {border_color}] {title} "
-                    f"[dim](completed in {elapsed:.1f}s)[/dim]"
-                )
-                content = Group(status_line, Rule(style="dim"), body)
-
-            footer = (
-                Text.from_markup(
-                    f"[{THEME['dim']}]full activity → /log[/]"
-                )
-                if activity
-                else Text("")
-            )
-            parts = [content, files_badge, footer] if activity else [content]
-            return Panel(
-                Group(*parts),
-                box=box.ROUNDED,
-                border_style=border_color if not done or exit_code == 0 else "red",
-                padding=(0, 2),
-            )
-
         try:
-            with Live(render_panel(), console=console, refresh_per_second=12) as live:
+            view = _AgentStreamView(
+                cmd=exec_cmd,
+                title=title,
+                border_color=border_color,
+                badge=badge,
+                attempt=attempt,
+                state=state,
+                lines=lines,
+                activity=activity,
+            )
+            with Live(view, console=console, refresh_per_second=20) as live:
                 assert proc.stdout is not None
                 for raw_line in proc.stdout:
                     clean = raw_line.rstrip("\r\n")
                     if clean:
                         ingest(clean)
                         lines.append(_fmt_activity(clean))
-                    live.update(render_panel(done=False))
-
+                    # Auto-refresh via Live thread is enough; optional tiny refresh
+                    live.refresh()
                 proc.wait(timeout=timeout)
-                live.update(render_panel(done=True, exit_code=proc.returncode))
+                view.done = True
+                view.exit_code = proc.returncode or 0
+                live.refresh()
                 finalize()
 
                 if proc.returncode == 0:
@@ -1327,13 +1673,19 @@ def show_plan_card(plan_file: Path) -> None:
         console.print(f"[yellow]No {plan_file} found in current directory.[/yellow]")
         return
     content = plan_file.read_text(encoding="utf-8")
+    pad_h = 2 if console.width >= 80 else 1
+    card_title = (
+        f"[bold yellow]📋 {plan_file.name} (Shared Agent Spec)[/bold yellow]"
+        if console.width >= 60
+        else f"[bold yellow]📋 {plan_file.name}[/]"
+    )
     console.print(
         Panel(
             Markdown(content),
-            title=f"[bold yellow]📋 {plan_file.name} (Shared Agent Spec)[/bold yellow]",
+            title=card_title,
             border_style="yellow",
             box=box.ROUNDED,
-            padding=(1, 2),
+            padding=(1, pad_h),
         )
     )
 
@@ -1344,6 +1696,8 @@ def show_plan_card(plan_file: Path) -> None:
 
 def step_plan(state: AgentState, task: str) -> bool:
     profile = state.profile("plan")
+    state.last_task = task
+    persist_active_chat(state)
     prompt = (
         f"Create a phased implementation plan in {state.plan_file} for: {task}.\n"
         "Requirements:\n"
@@ -1706,7 +2060,7 @@ def _ask_role(state: AgentState, role: str, first_run: bool = False) -> None:
     model_attr = "planner_model" if role == "plan" else "builder_model"
     effort_attr = "planner_effort" if role == "plan" else "builder_effort"
     current = getattr(state, attr)
-    candidates = [k for k in installed_profiles() if role in PROFILES[k].roles]
+    candidates = installed_profiles()
     role_label = "Planner / Auditor" if role == "plan" else "Builder"
 
     table = Table(
@@ -1718,7 +2072,7 @@ def _ask_role(state: AgentState, role: str, first_run: bool = False) -> None:
     table.add_column("Status", justify="center")
     table.add_column("About", style=THEME["dim"])
     for key, prof in PROFILES.items():
-        can = role in prof.roles
+        can = key in candidates
         exists = get_safe_executable(prof.binary) is not None
         if can and exists:
             status = f"[{THEME['ok']}]✓ ready[/]"
@@ -1727,7 +2081,7 @@ def _ask_role(state: AgentState, role: str, first_run: bool = False) -> None:
         else:
             status = f"[{THEME['dim']}]n/a[/]"
         name = f"{key}" + (
-            f" [{THEME['primary']}](current)[/]" if key == current and can else ""
+            f" [{THEME['primary']}](current)[/]" if key == current else ""
         )
         table.add_row(name, status, prof.blurb)
     console.print(table)
@@ -1753,12 +2107,55 @@ def _ask_role(state: AgentState, role: str, first_run: bool = False) -> None:
     console.print(f"[{THEME['ok']}]✓ {role_label} → {pick}[/]\n")
 
 
+def build_agent_scan_table(state: AgentState) -> Table | None:
+    """Build a table of agent CLIs installed on this PC + current selection."""
+    found = installed_profiles()
+    if not found:
+        return None
+
+    table = Table(
+        title="🔎 Installed agents on this PC",
+        box=box.ROUNDED,
+        border_style=THEME["primary"],
+        title_style=f"bold {THEME['primary']}",
+        padding=(0, 1),
+    )
+    table.add_column("Agent", style=f"bold {THEME['accent']}", no_wrap=True)
+    table.add_column("Plan / Audit", justify="center")
+    table.add_column("Build", justify="center")
+    table.add_column("Selected for", style=THEME["text"])
+    for key in found:
+        prof = PROFILES[key]
+        roles = []
+        if key == state.planner:
+            roles.append(f"[{THEME['architect']}]planner[/]")
+        if key == state.builder:
+            roles.append(f"[{THEME['builder']}]builder[/]")
+        table.add_row(
+            key,
+            f"[{THEME['ok']}]◆[/]" if "plan" in prof.roles else f"[{THEME['dim']}]—[/]",
+            f"[{THEME['ok']}]◆[/]" if "build" in prof.roles else f"[{THEME['dim']}]—[/]",
+            " · ".join(roles) if roles else f"[{THEME['dim']}]—[/]",
+        )
+    return table
+
+
 def run_setup_wizard(state: AgentState, first_run: bool = False) -> None:
-    """Assign an agent CLI to the planner and builder roles."""
+    """Scan the system for agent CLIs and assign one to each role."""
     heading = "First-run setup" if first_run else "Agent setup"
+    found = installed_profiles()
+    if found:
+        found_line = (
+            f"[{THEME['ok']}]Found {len(found)} agent CLI(s):[/] "
+            + ", ".join(f"[bold {THEME['text']}]{k}[/]" for k in found)
+        )
+    else:
+        found_line = f"[{THEME['err']}]No supported agent CLIs found on your PATH.[/]"
     console.print(
         Panel(
             f"[bold {THEME['primary']}]{heading}[/]\n"
+            f"[{THEME['dim']}]Scanning your PATH for installed agent CLIs…[/]\n"
+            f"{found_line}\n"
             f"[{THEME['text']}]Choose which agent CLI plays each role.[/] "
             f"[{THEME['dim']}]Change this anytime with[/] "
             f"[{THEME['primary']}]/agents[/][{THEME['dim']}].[/]",
@@ -1801,21 +2198,24 @@ def run_full_pipeline(state: AgentState, task: str) -> int:
     if not step_plan(state, task):
         return 1
 
-    if state.permission_mode != "auto":
+    if console.is_terminal:
         choice = arrow_menu(
-            "📋 Plan ready",
+            "📋 Plan ready — review before building",
             [
                 ("y", "▶  Proceed to build"),
                 ("n", "⏸  Pause — I'll review / edit the plan first"),
             ],
-            text=f"{state.plan_file} is ready",
+            text=f"{state.plan_file} is ready. Approve before the builder runs.",
             default="y",
         )
-        if choice != "y":
-            console.print(
-                f"[{THEME['warn']}]Paused. Edit {state.plan_file} and press /build or use the menu when ready.[/]\n"
-            )
-            return 0
+    else:
+        choice = "y" if state.permission_mode == "auto" else None
+
+    if choice != "y":
+        console.print(
+            f"[{THEME['warn']}]Paused. Edit {state.plan_file} and press /build or use the menu when ready.[/]\n"
+        )
+        return 0
 
     if not step_build(state, is_fix_pass=False):
         if state.last_status.startswith("BUILD_DENIED"):
@@ -2010,14 +2410,78 @@ def show_help() -> None:
     table.add_row("/plan <task>", "Run ONLY the planner — active model & effort")
     table.add_row("/build", "Run ONLY the builder + color-coded diff approval")
     table.add_row("/audit", "Run ONLY the planner to audit git diff & tests")
-    table.add_row("/conv <id>", "Set/clear the agy conversation UUID to resume old chat context")
+    table.add_row("/conv <id>", "Set/clear the conversation UUID (current chat only)")
+    table.add_row("/rember [n|id]", "List remembered chats, or resume one by number/id")
     table.add_row("", "")
     table.add_row("/diff", "Show color-coded git diff (+ green new / - red old)")
     table.add_row("/show", "Render PLAN.md with formatted Markdown")
     table.add_row("/font <text>", "Render text in 3D wireframe shadow or mini block font")
     table.add_row("/clear", "Clear the screen and redraw the banner")
+    table.add_row("Ctrl+L", "Clear the screen and redraw responsive banner")
     table.add_row("/exit", "Quit SpeiiDev")
     console.print(table)
+
+
+def handle_rember(state: AgentState, arg: str = "") -> None:
+    """List remembered chats or resume one by index/id."""
+    entries = load_rember()
+    arg = arg.strip()
+
+    if not entries:
+        console.print(
+            f"[{THEME['warn']}]No remembered chats yet.[/] "
+            f"Set one with [bold]{escape('/conv <id>')}[/bold] and it will be stored in "
+            f"{REMBER_FILE.name}."
+        )
+        return
+
+    if not arg:
+        w = console.width
+        table = Table(
+            title="⌘ Remembered Chats",
+            box=box.ROUNDED,
+            border_style=THEME["primary"],
+            title_style=f"bold {THEME['primary']}",
+            padding=(0, 1),
+        )
+        table.add_column("#", style=f"bold {THEME['accent']}", justify="right", no_wrap=True)
+        table.add_column("Chat ID", style=THEME["text"], no_wrap=True)
+        if w >= 65:
+            table.add_column("Time", style=THEME["dim"], no_wrap=True)
+        task_max_w = max(15, min(40, w - 30))
+        table.add_column("Task", style=THEME["text"], overflow="ellipsis", max_width=task_max_w)
+        for i, entry in enumerate(entries, 1):
+            label = str(entry.get("label", ""))
+            if label.startswith("chat ") or label.startswith("agent"):
+                label = ""
+            row_items = [str(i), str(entry.get("id", ""))]
+            if w >= 65:
+                row_items.append(str(entry.get("time", "")))
+            row_items.append(label)
+            table.add_row(*row_items)
+        console.print(table)
+        console.print(
+            f"[{THEME['dim']}]Resume with[/] "
+            f"[bold {THEME['accent']}]{escape('/rember <#|id>')}[/]\n"
+        )
+        return
+
+    selected: dict | None = None
+    if arg.isdigit() and 1 <= int(arg) <= len(entries):
+        selected = entries[int(arg) - 1]
+    else:
+        selected = next((e for e in entries if e.get("id") == arg), None)
+
+    if selected is None:
+        console.print(f"[{THEME['err']}]No remembered chat matches '{arg}'.[/]")
+        return
+
+    state.conversation_id = str(selected["id"])
+    remember_conversation(state.conversation_id, selected.get("label", ""))
+    console.print(
+        f"[{THEME['ok']}]✓ Resumed chat {state.conversation_id}[/] "
+        f"[{THEME['dim']}]({selected.get('time', '')})[/]"
+    )
 
 
 def interactive_repl(state: AgentState) -> int:
@@ -2038,18 +2502,42 @@ def interactive_repl(state: AgentState) -> int:
     )
 
     def bottom_toolbar() -> HTML:
-        conv_label = state.conversation_id[:8] + "…" if state.conversation_id else "new"
+        term_cols = shutil.get_terminal_size((80, 24)).columns
+        conv_label = (
+            state.conversation_id[:8] + "…"
+            if state.conversation_id
+            else state.session_id[:8] + "…"
+        )
         gate = {"auto": "AUTO", "deny": "DENY", "ask": "ASK"}.get(
             state.permission_mode, "ASK"
         )
-        return HTML(
-            f" <b>⌘ SPEIIDEV</b> 🥬 "
-            f"<ansicyan>{state.planner}</ansicyan> <b>{state.planner_model[:16]}</b> "
-            f"<ansimagenta>{state.builder}</ansimagenta> <b>{state.builder_model[:16]}</b>  "
-            f"gate <b>{gate}</b>  chat <b>{conv_label}</b>  "
-            f"<ansigreen>{state.last_status}</ansigreen>  "
-            f"<ansiyellow>F2 menu · F3 activity</ansiyellow> "
-        )
+        if term_cols >= 95:
+            return HTML(
+                f" <b>⌘ SPEIIDEV</b> 🥬 "
+                f"<ansicyan>{state.planner}</ansicyan> <b>{state.planner_model[:16]}</b> "
+                f"<ansimagenta>{state.builder}</ansimagenta> <b>{state.builder_model[:16]}</b>  "
+                f"gate <b>{gate}</b>  chat <b>{conv_label}</b>  "
+                f"<ansigreen>{state.last_status}</ansigreen>  "
+                f"<ansiyellow>F2 menu · F3 activity</ansiyellow> "
+            )
+        elif term_cols >= 75:
+            return HTML(
+                f" <b>⌘ SPEIIDEV</b> "
+                f"<ansicyan>{state.planner}</ansicyan> "
+                f"<ansimagenta>{state.builder}</ansimagenta>  "
+                f"gate <b>{gate}</b>  chat <b>{conv_label}</b>  "
+                f"<ansigreen>{state.last_status}</ansigreen>  "
+                f"<ansiyellow>F2 menu</ansiyellow> "
+            )
+        elif term_cols >= 50:
+            return HTML(
+                f" <b>⌘</b> <ansicyan>{state.planner}</ansicyan>·<ansimagenta>{state.builder}</ansimagenta> "
+                f"gate <b>{gate}</b> chat <b>{conv_label}</b> <ansiyellow>F2</ansiyellow> "
+            )
+        else:
+            return HTML(
+                f" <b>⌘</b> <b>{gate}</b> <ansiyellow>F2</ansiyellow> "
+            )
 
     try:
         history = FileHistory(str(HISTORY_FILE))
@@ -2069,18 +2557,51 @@ def interactive_repl(state: AgentState) -> int:
     def _open_activity(event):
         event.app.exit(result=ACTIVITY_SENTINEL)
 
+    @kb.add("c-l")
+    def _clear_and_redraw(event):
+        console.clear()
+        print_banner(state)
+        event.app.renderer.erase()
+
     session: PromptSession[str] = PromptSession(
         history=history,
         completer=completer,
         bottom_toolbar=bottom_toolbar,
         style=style,
         key_bindings=kb,
+        refresh_interval=0.5,
     )
+
+    orig_on_resize = session.app._on_resize
+    resize_timer: list[asyncio.TimerHandle | None] = [None]
+
+    def _do_redraw() -> None:
+        if getattr(session.app, "is_running", False):
+            console.clear()
+            print_banner(state)
+            try:
+                session.app.renderer.erase(leave_alternate_screen=False)
+                session.app._request_absolute_cursor_position()
+                session.app._redraw()
+            except Exception:
+                orig_on_resize()
+
+    def _handle_resize() -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            if resize_timer[0] is not None:
+                resize_timer[0].cancel()
+            resize_timer[0] = loop.call_later(0.08, _do_redraw)
+        except Exception:
+            _do_redraw()
+
+    session.app._on_resize = _handle_resize
 
     while True:
         try:
             user_input = session.prompt([("class:prompt", "❯ ")]).strip()
         except (EOFError, KeyboardInterrupt):
+            persist_active_chat(state)
             save_config(state)
             console.print("\n[dim]Goodbye![/dim]")
             return 0
@@ -2098,6 +2619,7 @@ def interactive_repl(state: AgentState) -> int:
             continue
 
         if user_input in ("/exit", "/quit", "exit", "quit"):
+            persist_active_chat(state)
             save_config(state)
             console.print("[dim]Goodbye![/dim]")
             return 0
@@ -2143,10 +2665,16 @@ def interactive_repl(state: AgentState) -> int:
             parts = user_input.split(maxsplit=1)
             if len(parts) > 1:
                 state.conversation_id = parts[1].strip()
-                console.print(f"[green]✓ Active conversation ID set to: {state.conversation_id}[/green]")
+                remember_conversation(state.conversation_id)
+                console.print(
+                    f"[green]✓ Active conversation ID set to: {state.conversation_id}[/green]"
+                )
             else:
                 state.conversation_id = None
                 console.print("[yellow]Conversation ID cleared (using new chat).[/yellow]")
+        elif user_input.startswith("/rember"):
+            parts = user_input.split(maxsplit=1)
+            handle_rember(state, parts[1] if len(parts) > 1 else "")
         elif user_input.startswith("/plan"):
             task = user_input[5:].strip()
             if not task:
@@ -2207,22 +2735,20 @@ def main() -> int:
     if permission_mode not in ("ask", "auto", "deny"):
         permission_mode = "ask"
 
-    planner = args.planner or cfg.get("planner", "agy")
-    builder = args.builder or cfg.get("builder", "opencode")
-    if planner not in PROFILES or "plan" not in PROFILES[planner].roles:
-        console.print(f"[{THEME['warn']}]'{planner}' cannot plan — falling back to agy.[/]")
-        planner = "agy"
-    if builder not in PROFILES or "build" not in PROFILES[builder].roles:
-        console.print(f"[{THEME['warn']}]'{builder}' cannot build — falling back to opencode.[/]")
-        builder = "opencode"
+    planner = args.planner or cfg.get("planner") or first_installed_for("plan") or installed_profiles()[0] if installed_profiles() else "agy"
+    builder = args.builder or cfg.get("builder") or first_installed_for("build") or installed_profiles()[0] if installed_profiles() else "opencode"
+    if planner not in PROFILES or not get_safe_executable(PROFILES[planner].binary):
+        candidates = installed_profiles()
+        planner = candidates[0] if candidates else "agy"
+    if builder not in PROFILES or not get_safe_executable(PROFILES[builder].binary):
+        candidates = installed_profiles()
+        builder = candidates[0] if candidates else "opencode"
 
     state = AgentState(
         plan_file=args.plan_file,
         max_retries=args.max_retries,
         auto_approve=permission_mode == "auto",
-        conversation_id=(
-            args.conversation if args.conversation is not None else cfg.get("conversation_id")
-        ),
+        conversation_id=args.conversation,
         planner=planner,
         builder=builder,
         planner_model=args.planner_model or cfg.get("planner_model", "default"),
@@ -2236,6 +2762,24 @@ def main() -> int:
     if isinstance(saved, list):
         state.approved_actions = {str(a) for a in saved}
 
+    if state.conversation_id:
+        remember_conversation(state.conversation_id)
+
+    if not args.no_splash:
+        run_splash(state)
+
+    explicit_agents = bool(args.planner or args.builder)
+    interactive = console.is_terminal and not args.task
+
+    planner_missing = get_safe_executable(PROFILES[state.planner].binary) is None
+    builder_missing = get_safe_executable(PROFILES[state.builder].binary) is None
+    needs_pick = first_run or planner_missing or builder_missing
+
+    if interactive and not args.no_save:
+        if needs_pick and not explicit_agents:
+            run_setup_wizard(state, first_run=first_run)
+            save_config(state)
+
     missing = [
         f"{role}:{key} ({PROFILES[key].binary})"
         for role, key in (("planner", state.planner), ("builder", state.builder))
@@ -2243,18 +2787,13 @@ def main() -> int:
     ]
     if missing:
         console.print(
-            f"[bold red]❌ Missing required CLI binaries on PATH:[/bold red] "
-            f"{', '.join(missing)}"
+            f"[bold red]❌ No agent CLI found for:[/bold red] {', '.join(missing)}\n"
+            f"[{THEME['text']}]Install at least one supported agent on your PATH:[/] "
+            f"{', '.join(PROFILES)}.\n"
+            f"[{THEME['dim']}]Tip: run [/][{THEME['primary']}]/agents[/]"
+            f"[{THEME['dim']}] inside the tool to scan and pick again.[/]"
         )
         return 1
-
-    if not args.no_splash:
-        run_splash(state)
-
-    explicit_agents = bool(args.planner or args.builder)
-    if first_run and not args.task and not explicit_agents and not args.no_save:
-        run_setup_wizard(state, first_run=True)
-        save_config(state)
 
     if args.task:
         print_banner(state)

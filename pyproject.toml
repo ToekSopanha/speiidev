@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autodev-orchestrator"
-version = "4.0.0"
+dynamic = ["version"]
 description = "Interactive Multi-Agent TUI with pluggable agents, model switcher, diff gate, and conversation memory."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -53,9 +53,13 @@ image = [
 ]
 
 [project.scripts]
-autodev = "autodev.cli:main"
 speiidev = "autodev.cli:main"
+autodev = "autodev.cli:main"
 block-font = "autodev.font:main"
+render-pixel-art = "autodev.pixel_art:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "autodev._version.__version__" }

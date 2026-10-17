@@ -4,6 +4,11 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
+import sys
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 try:
     from PIL import Image
     HAS_PIL = True
@@ -11,7 +16,7 @@ except ImportError:
     HAS_PIL = False
 
 if HAS_PIL:
-    from render_pixel_art import (
+    from autodev.pixel_art import (
         detect_background_mask,
         load_and_resize_image,
         render_pixel_art,

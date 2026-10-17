@@ -208,14 +208,14 @@ To activate it in Claude Code:
 Tests the complete packaging workflow from scratch—creating an isolated sandbox in `/tmp`, installing `autodev-orchestrator`, verifying real console binaries (`speiidev`, `block-font`), and running all tests with **zero changes to your system**:
 
 ```bash
-python3 test_real_install.py
+python3 scripts/test_real_install.py
 ```
 
 ### 2. Fast Unit Test Runner
 Run the full 16-test automated suite directly:
 
 ```bash
-python3 run_tests.py
+python3 scripts/run_tests.py
 # or
 python3 -m unittest discover -s tests -v
 
@@ -234,23 +234,32 @@ autodev/
 ├── .claude/
 │   └── output-styles/          # Claude Code custom output styles
 │       └── speiidev-block.md   # 3D wireframe shadow font style
-├── .gitignore                  # Git ignore rules for Python
-├── CLAUDE.md                   # Instructions and branding for Claude Code
-├── pyproject.toml              # Build configuration & entry points
-├── README.md                   # Documentation
-├── render_pixel_art.py         # TrueColor ANSI terminal pixel art utility
-├── block-font                  # Direct CLI runner for block art text
-├── speiidev                    # Direct executable runner
-├── autodev -> speiidev         # Executable runner symlink
-├── run_tests.py                # Fast Python test runner
-├── test_real_install.py        # Disposable sandbox install & test runner
+├── .gitignore                  # Git ignore rules for Python & Node
+├── bin/                        # Executable CLI launchers & wrappers
+│   ├── block-font              # 3D block font launcher
+│   ├── cli.js                  # Node.js npm/npx wrapper
+│   └── speiidev                # SpeiiDev main executable launcher
+├── scripts/                    # Development & testing utilities
+│   ├── run_tests.py            # Automated unit test suite runner
+│   └── test_real_install.py    # Disposable sandbox install & test runner
+├── src/                        # Main Python package source
+│   └── autodev/
+│       ├── __init__.py         # Package entrypoint & public exports
+│       ├── __main__.py         # Allows `python -m autodev`
+│       ├── cli.py              # Cross-platform SpeiiDev TUI orchestrator
+│       ├── font.py             # 3D wireframe shadow & 2-line font engine
+│       └── pixel_art.py        # TrueColor ANSI terminal pixel art utility
 ├── tests/                      # Automated test suite
+│   ├── __init__.py
 │   ├── test_cli.py             # CLI options, profiles, and state tests
 │   ├── test_font.py            # Claude 3D and 2-line font typography tests
 │   └── test_pixel_art.py       # TrueColor ANSI half-block renderer tests
-└── src/
-    └── autodev/
-        ├── __init__.py         # Package entrypoint & exports
+├── CLAUDE.md                   # Instructions and branding for Claude Code
+├── package.json                # NPM wrapper configuration
+├── pyproject.toml              # Build configuration & entry points
+├── README.md                   # Documentation
+└── speiidev -> bin/speiidev    # Root convenience symlink
+```
         ├── __main__.py         # Allows `python -m autodev`
         ├── font.py             # 3D wireframe shadow & 2-line font engine
         └── cli.py              # Cross-platform SpeiiDev orchestrator & TUI with Bok Choy logo
