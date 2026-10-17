@@ -118,6 +118,7 @@ SLASH_COMMANDS = [
     "/model",
     "/effort",
     "/perms",
+    "/update",
     "/log",
     "/conv",
     "/rember",
@@ -2361,6 +2362,7 @@ def open_action_menu(state: AgentState) -> None:
             ("model", "🧠  Switch model"),
             ("effort", "⚡  Change effort"),
             ("perms", "🔐  Permission gate"),
+            ("update", "🔄  Update SpeiiDev"),
             ("help", "❓  Help"),
             ("exit", "🚪  Exit"),
         ],
@@ -2380,6 +2382,8 @@ def open_action_menu(state: AgentState) -> None:
         handle_effort_switcher(state)
     elif action == "perms":
         handle_permissions(state)
+    elif action == "update":
+        handle_self_update()
     elif action == "help":
         show_help()
 
@@ -2418,8 +2422,84 @@ def show_help() -> None:
     table.add_row("/font <text>", "Render text in 3D wireframe shadow or mini block font")
     table.add_row("/clear", "Clear the screen and redraw the banner")
     table.add_row("Ctrl+L", "Clear the screen and redraw responsive banner")
+    table.add_row("/update", "Update SpeiiDev to the latest version from npm or PyPI")
     table.add_row("/exit", "Quit SpeiiDev")
     console.print(table)
+
+
+def check_latest_version(timeout: float = 2.0) -> str | None:
+    """Query PyPI or npm registry to check the latest released version."""
+    import urllib.request
+    try:
+        url = "https://pypi.org/pypi/speiidev/json"
+        req = urllib.request.Request(url, headers={"User-Agent": "speiidev-updater"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            v = data.get("info", {}).get("version")
+            if v:
+                return str(v)
+    except Exception:
+        pass
+    try:
+        url = "https://registry.npmjs.org/speiidev/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "speiidev-updater"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            v = data.get("version")
+            if v:
+                return str(v)
+    except Exception:
+        pass
+    return None
+
+
+def handle_self_update() -> int:
+    """Automatically detect installation method and update SpeiiDev."""
+    console.print(f"\n[bold {THEME['primary']}]🔄 Checking for SpeiiDev updates…[/bold {THEME['primary']}]")
+    latest = check_latest_version(timeout=2.5)
+    if latest:
+        console.print(
+            f"[{THEME['dim']}]Current version:[/] [bold]{APP_VERSION}[/]  "
+            f"[{THEME['dim']}]Latest version:[/] [bold green]{latest}[/]"
+        )
+        if latest == APP_VERSION:
+            console.print(f"[bold {THEME['ok']}]✅ SpeiiDev is already up to date ({APP_VERSION})![/]\n")
+            return 0
+        console.print(f"[{THEME['accent']}]🚀 Upgrading SpeiiDev {APP_VERSION} → {latest}…[/]")
+    else:
+        console.print(f"[{THEME['dim']}]Checking latest release packages…[/]")
+
+    is_npm = os.environ.get("SPEIIDEV_INSTALLER") == "npm" or "node_modules" in sys.argv[0]
+    npm_bin = shutil.which("npm")
+    pipx_bin = shutil.which("pipx")
+
+    updated = False
+    if is_npm and npm_bin:
+        console.print(f"[{THEME['dim']}]Updating via npm: npm install -g --force speiidev@latest[/]")
+        res = subprocess.run([npm_bin, "install", "-g", "--force", "speiidev@latest"])
+        updated = (res.returncode == 0)
+    elif pipx_bin and "pipx" in sys.prefix:
+        console.print(f"[{THEME['dim']}]Updating via pipx: pipx upgrade speiidev[/]")
+        res = subprocess.run([pipx_bin, "upgrade", "speiidev"])
+        updated = (res.returncode == 0)
+    else:
+        console.print(f"[{THEME['dim']}]Updating via pip: python -m pip install -U speiidev[/]")
+        res = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "speiidev"])
+        if res.returncode != 0:
+            console.print(f"[{THEME['dim']}]Retrying with --break-system-packages…[/]")
+            res = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--break-system-packages", "speiidev"])
+        updated = (res.returncode == 0)
+
+    if updated:
+        console.print(f"\n[bold {THEME['ok']}]🎉 SpeiiDev successfully updated to {latest or 'latest'}![/bold {THEME['ok']}]")
+        console.print(f"[{THEME['text']}]Please restart speiidev to run the new version.[/]\n")
+        return 0
+    else:
+        console.print(f"\n[{THEME['err']}]❌ Automatic update encountered an issue. Run one of these manually:[/]")
+        console.print(f"  [{THEME['primary']}]npm install -g --force speiidev@latest[/]")
+        console.print(f"  [{THEME['primary']}]pipx install speiidev --force[/]")
+        console.print(f"  [{THEME['primary']}]pip install -U speiidev[/]\n")
+        return 1
 
 
 def handle_rember(state: AgentState, arg: str = "") -> None:
@@ -2625,6 +2705,8 @@ def interactive_repl(state: AgentState) -> int:
             return 0
         elif user_input == "/help":
             show_help()
+        elif user_input == "/update":
+            handle_self_update()
         elif user_input == "/clear":
             console.clear()
             print_banner(state)
@@ -2720,7 +2802,16 @@ def main() -> int:
         default="claude",
         help="Font style: claude (3D wireframe shadow) or mini (compact 2-line)",
     )
+    parser.add_argument("-v", "--version", action="store_true", help="Print version and exit")
+    parser.add_argument("--update", action="store_true", help="Update SpeiiDev to latest version and exit")
     args = parser.parse_args()
+
+    if args.version:
+        console.print(f"SpeiiDev v{APP_VERSION}")
+        return 0
+
+    if args.update:
+        return handle_self_update()
 
     if args.font is not None:
         console.print(f"[bold {THEME['primary']}]{render_block_text(args.font, style=args.font_style, color='none')}[/]")

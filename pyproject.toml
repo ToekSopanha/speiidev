@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "autodev-orchestrator"
+name = "speiidev"
 dynamic = ["version"]
 description = "Interactive Multi-Agent TUI with pluggable agents, model switcher, diff gate, and conversation memory."
 readme = "README.md"

@@ -204,6 +204,22 @@ class TestCLIHelpers(unittest.TestCase):
                     f"Stream view panel line width {len(line)} exceeded terminal width {w} at {w}x{h}",
                 )
 
+    def test_version_flag(self):
+        from autodev.cli import main
+        import sys
+        old_argv = sys.argv
+        try:
+            sys.argv = ["speiidev", "--version"]
+            rc = main()
+            self.assertEqual(rc, 0)
+        finally:
+            sys.argv = old_argv
+
+    def test_slash_commands_include_update(self):
+        from autodev.cli import SLASH_COMMANDS
+        self.assertIn("/update", SLASH_COMMANDS)
+
 
 if __name__ == "__main__":
     unittest.main()
+
